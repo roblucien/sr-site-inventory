@@ -31,7 +31,7 @@ err()     { printf "  ${RD}✖${R}  %s\n" "$1" >&2; }
 # ── Data ──────────────────────────────────────────────────────────────────────
 SRV_MAKE="N/A"; SRV_MODEL="N/A"; SRV_SERIAL="N/A"
 INST_DATE=""; LOCATION=""
-SW_MAC="N/A"; SW_IP="N/A"; SW_HOST="N/A"; SW_MFR="N/A"
+SW_MAC="N/A"; SW_IP="N/A"; SW_HOST="N/A"; SW_MFR="N/A"; SW_SERIAL="N/A"
 CAMERAS=()
 TECH_NAME=""; SR_CONTACT=""; JOB_NUM=""; NOTES=""
 REPORT_FILE=""; GIST_URL=""
@@ -39,7 +39,7 @@ REPORT_FILE=""; GIST_URL=""
 # ── Dependencies ──────────────────────────────────────────────────────────────
 check_deps() {
     local missing=()
-    for cmd in whiptail dmidecode curl python3; do
+    for cmd in whiptail dmidecode curl python3 sshpass; do
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
     [[ ${#missing[@]} -eq 0 ]] && return 0
@@ -66,8 +66,8 @@ discover_server() {
 discover_switch() {
     local raw line
     raw=$(sudo dhcp-lease-list 2>/dev/null || true)
-    # Skip header rows, grab first line with an IP address
-    line=$(awk 'NR>2 && /([0-9]{1,3}\.){3}[0-9]/{print; exit}' <<< "$raw")
+    # Switch is always the LAST entry in the lease list
+    line=$(awk '/([0-9]{1,3}\.){3}[0-9]/{last=$0} END{print last}' <<< "$raw")
     if [[ -z "$line" ]]; then
         warn "No DHCP lease found for switch."
         return 0
@@ -80,6 +80,32 @@ discover_switch() {
     [[ -z "$SW_MAC"  ]] && SW_MAC="N/A"
     [[ -z "$SW_HOST" ]] && SW_HOST="N/A"
     [[ -z "$SW_MFR"  ]] && SW_MFR="N/A"
+}
+
+discover_switch_serial() {
+    [[ "$SW_IP" == "N/A" ]] && return 0
+
+    local sw_pass
+    sw_pass=$(whiptail --passwordbox \
+        "SSH password for network switch at ${SW_IP}:" \
+        8 56 --title "Switch Login" 3>&1 1>&2 2>&3) || return 0
+    [[ -z "$sw_pass" ]] && return 0
+
+    info "SSHing into switch ${SW_IP} to retrieve serial..."
+    local inv
+    inv=$(sshpass -p "$sw_pass" ssh \
+        -o StrictHostKeyChecking=no \
+        -o ConnectTimeout=8 \
+        -o BatchMode=no \
+        "admin@${SW_IP}" "sh inventory" 2>/dev/null) || {
+        warn "Could not SSH into switch — serial will be N/A"
+        return 0
+    }
+
+    # 'show inventory' on Cisco: "SN: XXXXXXXXXXX"
+    SW_SERIAL=$(grep -i '\bSN:' <<< "$inv" | head -1 \
+        | sed 's/.*SN:[[:space:]]*//' | awk '{print $1}')
+    [[ -z "$SW_SERIAL" ]] && SW_SERIAL="N/A"
 }
 
 discover_cameras() {
@@ -96,7 +122,6 @@ discover_cameras() {
         [[ "$line" =~ [Nn]etwork[[:space:]][Dd]evices ]] && { in_section=1; continue; }
         [[ $in_section -eq 0 ]]  && continue
         [[ -z "${line//[[:space:]]/}" ]] && continue
-        # Skip the header row (starts with whitespace then 'ip')
         [[ "$line" =~ [[:space:]]ip[[:space:]] ]] && continue
 
         local parsed
@@ -106,8 +131,6 @@ discover_cameras() {
                 state=$8; gsub(/[(),]/,"",state);
                 hostname=$NF;
                 vendor=""; for(i=9;i<=NF-1;i++) vendor=vendor (i>9?" ":"") $i;
-                # model = second-to-last dash-segment of hostname
-                # serial = last dash-segment of hostname
                 n=split(hostname,parts,"-");
                 serial=(n>=1) ? parts[n]   : "N/A";
                 model =(n>=2) ? parts[n-1] : "N/A";
@@ -116,7 +139,6 @@ discover_cameras() {
         ' <<< "$line")
 
         [[ -z "$parsed" ]] && continue
-        # Validate: first field must look like an IP
         [[ "$parsed" =~ ^[0-9]+\. ]] || continue
         CAMERAS+=("$parsed")
     done <<< "$raw"
@@ -127,9 +149,10 @@ run_discovery() {
     printf "\n${B}${CY}  SR SITE INSTALL INVENTORY${R}\n\n"
     info "Running auto-discovery..."
     printf "\n"
-    discover_server  && info "Server:  ${SRV_MAKE} ${SRV_MODEL} [${SRV_SERIAL}]"
-    discover_switch  && info "Switch:  ${SW_IP} (${SW_HOST})"
-    discover_cameras && info "Cameras: ${#CAMERAS[@]} found"
+    discover_server       && info "Server:  ${SRV_MAKE} ${SRV_MODEL} [${SRV_SERIAL}]"
+    discover_switch       && info "Switch:  ${SW_IP} (${SW_HOST})"
+    discover_switch_serial && info "Switch serial: ${SW_SERIAL}"
+    discover_cameras      && info "Cameras: ${#CAMERAS[@]} found"
     printf "\n"
     sleep 1
 }
@@ -169,6 +192,7 @@ render_report() {
     field "MAC"          "${SW_MAC}"
     field "Hostname"     "${SW_HOST}"
     field "Manufacturer" "${SW_MFR}"
+    field "Serial"       "${SW_SERIAL}"
 
     section "NETWORK DEVICES  (${#CAMERAS[@]} via kee camera detect)"
     if [[ ${#CAMERAS[@]} -eq 0 ]]; then
@@ -196,36 +220,41 @@ render_report() {
     printf "\n"
     hr
     printf "\n"
+    read -rp "  Press Enter for action menu..." _
 }
 
 # ── Edit a field ──────────────────────────────────────────────────────────────
 edit_field() {
     local choice
-    choice=$(whiptail --menu "Select field to edit:" 20 60 10 \
-        "1"  "Onsite Tech:    ${TECH_NAME}"          \
-        "2"  "SR Contact:     ${SR_CONTACT}"         \
-        "3"  "Job Number:     ${JOB_NUM}"            \
-        "4"  "Notes:          ${NOTES:0:30}"         \
-        "5"  "Location:       ${LOCATION}"           \
-        "6"  "Server Make:    ${SRV_MAKE}"           \
-        "7"  "Server Model:   ${SRV_MODEL}"          \
-        "8"  "Server Serial:  ${SRV_SERIAL}"         \
-        "9"  "Switch IP:      ${SW_IP}"              \
-        "10" "Switch MAC:     ${SW_MAC}"             \
+    choice=$(whiptail --menu "Select field to edit:" 22 62 12 \
+        "1"  "Onsite Tech:     ${TECH_NAME}"      \
+        "2"  "SR Contact:      ${SR_CONTACT}"     \
+        "3"  "Job Number:      ${JOB_NUM}"        \
+        "4"  "Notes:           ${NOTES:0:30}"     \
+        "5"  "Location:        ${LOCATION}"       \
+        "6"  "Server Make:     ${SRV_MAKE}"       \
+        "7"  "Server Model:    ${SRV_MODEL}"      \
+        "8"  "Server Serial:   ${SRV_SERIAL}"     \
+        "9"  "Switch IP:       ${SW_IP}"          \
+        "10" "Switch MAC:      ${SW_MAC}"         \
+        "11" "Switch Serial:   ${SW_SERIAL}"      \
+        "12" "Switch MFR:      ${SW_MFR}"         \
         --title "Edit Field" 3>&1 1>&2 2>&3) || return 0
 
     local val
     case "$choice" in
-        1)  val=$(wt_input "Edit" "Onsite Tech Name:"   "${TECH_NAME}")   && TECH_NAME="$val"   || true ;;
-        2)  val=$(wt_input "Edit" "SR Support Contact:" "${SR_CONTACT}")  && SR_CONTACT="$val"  || true ;;
-        3)  val=$(wt_input "Edit" "Job / Ticket #:"     "${JOB_NUM}")     && JOB_NUM="$val"     || true ;;
-        4)  val=$(wt_input "Edit" "Notes:"              "${NOTES}")       && NOTES="$val"       || true ;;
-        5)  val=$(wt_input "Edit" "Location:"           "${LOCATION}")    && LOCATION="$val"    || true ;;
-        6)  val=$(wt_input "Edit" "Server Make:"        "${SRV_MAKE}")    && SRV_MAKE="$val"    || true ;;
-        7)  val=$(wt_input "Edit" "Server Model:"       "${SRV_MODEL}")   && SRV_MODEL="$val"   || true ;;
-        8)  val=$(wt_input "Edit" "Server Serial:"      "${SRV_SERIAL}")  && SRV_SERIAL="$val"  || true ;;
-        9)  val=$(wt_input "Edit" "Switch IP:"          "${SW_IP}")       && SW_IP="$val"       || true ;;
-        10) val=$(wt_input "Edit" "Switch MAC:"         "${SW_MAC}")      && SW_MAC="$val"      || true ;;
+        1)  val=$(wt_input "Edit" "Onsite Tech Name:"    "${TECH_NAME}")  && TECH_NAME="$val"  || true ;;
+        2)  val=$(wt_input "Edit" "SR Support Contact:"  "${SR_CONTACT}") && SR_CONTACT="$val" || true ;;
+        3)  val=$(wt_input "Edit" "Job / Ticket #:"      "${JOB_NUM}")    && JOB_NUM="$val"    || true ;;
+        4)  val=$(wt_input "Edit" "Notes:"               "${NOTES}")      && NOTES="$val"      || true ;;
+        5)  val=$(wt_input "Edit" "Location:"            "${LOCATION}")   && LOCATION="$val"   || true ;;
+        6)  val=$(wt_input "Edit" "Server Make:"         "${SRV_MAKE}")   && SRV_MAKE="$val"   || true ;;
+        7)  val=$(wt_input "Edit" "Server Model:"        "${SRV_MODEL}")  && SRV_MODEL="$val"  || true ;;
+        8)  val=$(wt_input "Edit" "Server Serial:"       "${SRV_SERIAL}") && SRV_SERIAL="$val" || true ;;
+        9)  val=$(wt_input "Edit" "Switch IP:"           "${SW_IP}")      && SW_IP="$val"      || true ;;
+        10) val=$(wt_input "Edit" "Switch MAC:"          "${SW_MAC}")     && SW_MAC="$val"     || true ;;
+        11) val=$(wt_input "Edit" "Switch Serial:"       "${SW_SERIAL}")  && SW_SERIAL="$val"  || true ;;
+        12) val=$(wt_input "Edit" "Switch Manufacturer:" "${SW_MFR}")     && SW_MFR="$val"     || true ;;
     esac
 }
 
@@ -244,8 +273,8 @@ build_md() {
             "$SRV_MAKE" "$SRV_MODEL" "$SRV_SERIAL"
         printf "## Network Switch\n\n"
         printf "| Field | Value |\n|---|---|\n"
-        printf "| IP | %s |\n| MAC | %s |\n| Hostname | %s |\n| Manufacturer | %s |\n\n" \
-            "$SW_IP" "$SW_MAC" "$SW_HOST" "$SW_MFR"
+        printf "| IP | %s |\n| MAC | %s |\n| Hostname | %s |\n| Manufacturer | %s |\n| Serial | %s |\n\n" \
+            "$SW_IP" "$SW_MAC" "$SW_HOST" "$SW_MFR" "$SW_SERIAL"
         printf "## Network Devices (%d)\n\n" "${#CAMERAS[@]}"
         if [[ ${#CAMERAS[@]} -gt 0 ]]; then
             printf "| Hostname | IP | MAC | Vendor | Model | Serial |\n"
@@ -278,7 +307,6 @@ upload_gist() {
         10 64 --title "GitHub Gist Upload" 3>&1 1>&2 2>&3) || return 1
     [[ -z "$pat" ]] && { warn "No token entered — skipping upload."; return 1; }
 
-    # Build JSON payload safely via python3 (handles all escaping)
     local payload
     payload=$(python3 - "$LOCATION" "$INST_DATE" "$fname" "$mdfile" <<'PYEOF'
 import json, sys
