@@ -1,0 +1,353 @@
+#!/usr/bin/env bash
+# install-report.sh — Sportradar Site Install Inventory
+# https://github.com/roblucien/sr-site-inventory
+
+set -uo pipefail
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+B=$(tput bold   2>/dev/null || printf '')
+R=$(tput sgr0   2>/dev/null || printf '')
+CY=$(tput setaf 6 2>/dev/null || printf '')
+GR=$(tput setaf 2 2>/dev/null || printf '')
+YL=$(tput setaf 3 2>/dev/null || printf '')
+RD=$(tput setaf 1 2>/dev/null || printf '')
+COLS=$(tput cols 2>/dev/null || echo 80)
+
+hr()      { printf "${CY}"; printf '%*s' "$COLS" '' | tr ' ' '─'; printf "${R}\n"; }
+section() { printf "\n${B}${CY} ◆ %s${R}\n" "$1"; }
+field()   { printf "   ${B}%-22s${R}%s\n" "$1:" "$2"; }
+info()    { printf "  ${GR}✔${R}  %s\n" "$1"; }
+warn()    { printf "  ${YL}⚠${R}  %s\n" "$1"; }
+err()     { printf "  ${RD}✖${R}  %s\n" "$1" >&2; }
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+SRV_MAKE="N/A"; SRV_MODEL="N/A"; SRV_SERIAL="N/A"
+INST_DATE=""; LOCATION=""
+SW_MAC="N/A"; SW_IP="N/A"; SW_HOST="N/A"; SW_MFR="N/A"
+CAMERAS=()
+TECH_NAME=""; SR_CONTACT=""; JOB_NUM=""; NOTES=""
+REPORT_FILE=""; GIST_URL=""
+
+# ── Dependencies ──────────────────────────────────────────────────────────────
+check_deps() {
+    local missing=()
+    for cmd in whiptail dmidecode curl python3; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    done
+    [[ ${#missing[@]} -eq 0 ]] && return 0
+    printf "${YL}Missing packages: %s${R}\n" "${missing[*]}"
+    read -rp "  Install now (requires sudo)? [y/N] " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || { err "Aborting."; exit 1; }
+    sudo apt-get install -y "${missing[@]}" || { err "Install failed."; exit 1; }
+}
+
+# ── Discovery ─────────────────────────────────────────────────────────────────
+discover_server() {
+    local dmi
+    dmi=$(sudo dmidecode -t system 2>/dev/null || true)
+    SRV_MAKE=$(grep -m1   'Manufacturer:'  <<< "$dmi" | sed 's/.*Manufacturer:[[:space:]]*//'  | xargs)
+    SRV_MODEL=$(grep -m1  'Product Name:'  <<< "$dmi" | sed 's/.*Product Name:[[:space:]]*//'  | xargs)
+    SRV_SERIAL=$(grep -m1 'Serial Number:' <<< "$dmi" | sed 's/.*Serial Number:[[:space:]]*//' | xargs)
+    [[ -z "$SRV_MAKE"   ]] && SRV_MAKE="N/A"
+    [[ -z "$SRV_MODEL"  ]] && SRV_MODEL="N/A"
+    [[ -z "$SRV_SERIAL" ]] && SRV_SERIAL="N/A"
+    INST_DATE=$(date '+%Y-%m-%d %H:%M')
+    LOCATION=$(hostname | grep -oP 'KS-US-[A-Z0-9]+' || hostname)
+}
+
+discover_switch() {
+    local raw line
+    raw=$(sudo dhcp-lease-list 2>/dev/null || true)
+    # Skip header rows, grab first line with an IP address
+    line=$(awk 'NR>2 && /([0-9]{1,3}\.){3}[0-9]/{print; exit}' <<< "$raw")
+    if [[ -z "$line" ]]; then
+        warn "No DHCP lease found for switch."
+        return 0
+    fi
+    SW_IP=$(awk  '{print $1}' <<< "$line")
+    SW_MAC=$(awk '{print $2}' <<< "$line")
+    SW_HOST=$(awk '{print $3}' <<< "$line")
+    SW_MFR=$(awk '{$1=$2=$3=""; gsub(/^[[:space:]]+/,""); print}' <<< "$line" | xargs)
+    [[ -z "$SW_IP"   ]] && SW_IP="N/A"
+    [[ -z "$SW_MAC"  ]] && SW_MAC="N/A"
+    [[ -z "$SW_HOST" ]] && SW_HOST="N/A"
+    [[ -z "$SW_MFR"  ]] && SW_MFR="N/A"
+}
+
+discover_cameras() {
+    CAMERAS=()
+    local raw
+    raw=$(kee camera detect 2>/dev/null || true)
+    [[ -z "$raw" ]] && { warn "kee camera detect: no output."; return 0; }
+
+    # Actual column order (row# ip iface mac last_seen[3words] state vendor[1-N words] hostname):
+    #   $1=row#  $2=ip  $3=iface  $4=mac  $5-$7=last_seen  $8=state  $9..$(NF-1)=vendor  $NF=hostname
+    # Hostname encodes make/model/serial: last segment=serial, second-to-last=model
+    local in_section=0
+    while IFS= read -r line; do
+        [[ "$line" =~ [Nn]etwork[[:space:]][Dd]evices ]] && { in_section=1; continue; }
+        [[ $in_section -eq 0 ]]  && continue
+        [[ -z "${line//[[:space:]]/}" ]] && continue
+        # Skip the header row (starts with whitespace then 'ip')
+        [[ "$line" =~ [[:space:]]ip[[:space:]] ]] && continue
+
+        local parsed
+        parsed=$(awk '
+            NF > 8 {
+                ip=$2; mac=$4;
+                state=$8; gsub(/[(),]/,"",state);
+                hostname=$NF;
+                vendor=""; for(i=9;i<=NF-1;i++) vendor=vendor (i>9?" ":"") $i;
+                # model = second-to-last dash-segment of hostname
+                # serial = last dash-segment of hostname
+                n=split(hostname,parts,"-");
+                serial=(n>=1) ? parts[n]   : "N/A";
+                model =(n>=2) ? parts[n-1] : "N/A";
+                print ip "|" mac "|" state "|" vendor "|" hostname "|" model "|" serial
+            }
+        ' <<< "$line")
+
+        [[ -z "$parsed" ]] && continue
+        # Validate: first field must look like an IP
+        [[ "$parsed" =~ ^[0-9]+\. ]] || continue
+        CAMERAS+=("$parsed")
+    done <<< "$raw"
+}
+
+run_discovery() {
+    clear
+    printf "\n${B}${CY}  SR SITE INSTALL INVENTORY${R}\n\n"
+    info "Running auto-discovery..."
+    printf "\n"
+    discover_server  && info "Server:  ${SRV_MAKE} ${SRV_MODEL} [${SRV_SERIAL}]"
+    discover_switch  && info "Switch:  ${SW_IP} (${SW_HOST})"
+    discover_cameras && info "Cameras: ${#CAMERAS[@]} found"
+    printf "\n"
+    sleep 1
+}
+
+# ── User prompts ──────────────────────────────────────────────────────────────
+wt_input() {  # wt_input "Title" "Prompt" "default"
+    whiptail --inputbox "$2" 9 62 "$3" --title "$1" 3>&1 1>&2 2>&3
+}
+
+prompt_user() {
+    local val
+    val=$(wt_input "Personnel" "Onsite technician name:"         "${TECH_NAME}")  && TECH_NAME="$val"  || true
+    val=$(wt_input "Personnel" "Sportradar support contact:"     "${SR_CONTACT}") && SR_CONTACT="$val" || true
+    val=$(wt_input "Job Info"  "Job / ticket number (optional):" "${JOB_NUM}")    && JOB_NUM="$val"    || true
+    val=$(wt_input "Notes"     "Additional notes (optional):"    "${NOTES}")      && NOTES="$val"      || true
+}
+
+# ── Report display ────────────────────────────────────────────────────────────
+render_report() {
+    clear
+    hr
+    printf "${B}${CY}  SPORTRADAR — SITE INSTALL REPORT${R}\n"
+    hr
+
+    section "INSTALL INFO"
+    field "Location"  "${LOCATION}"
+    field "Date"      "${INST_DATE}"
+    [[ -n "$JOB_NUM" ]] && field "Job #" "${JOB_NUM}"
+
+    section "SERVER"
+    field "Make"   "${SRV_MAKE}"
+    field "Model"  "${SRV_MODEL}"
+    field "Serial" "${SRV_SERIAL}"
+
+    section "NETWORK SWITCH"
+    field "IP"           "${SW_IP}"
+    field "MAC"          "${SW_MAC}"
+    field "Hostname"     "${SW_HOST}"
+    field "Manufacturer" "${SW_MFR}"
+
+    section "NETWORK DEVICES  (${#CAMERAS[@]} via kee camera detect)"
+    if [[ ${#CAMERAS[@]} -eq 0 ]]; then
+        printf "   ${YL}None detected${R}\n"
+    else
+        local idx=0
+        for cam in "${CAMERAS[@]}"; do
+            idx=$((idx+1))
+            IFS='|' read -r ci cm cst cv ch cmo cse <<< "$cam"
+            printf "   ${B}%2d.${R} %-15s %s\n" "$idx" "$ci" "$ch"
+            printf "       ${B}Vendor:${R} %-30s ${B}Model:${R} %-12s ${B}Serial:${R} %s\n" \
+                "$cv" "$cmo" "$cse"
+        done
+    fi
+
+    section "PERSONNEL"
+    field "Onsite Tech" "${TECH_NAME:-—}"
+    field "SR Support"  "${SR_CONTACT:-—}"
+
+    if [[ -n "$NOTES" ]]; then
+        section "NOTES"
+        printf "   %s\n" "${NOTES}"
+    fi
+
+    printf "\n"
+    hr
+    printf "\n"
+}
+
+# ── Edit a field ──────────────────────────────────────────────────────────────
+edit_field() {
+    local choice
+    choice=$(whiptail --menu "Select field to edit:" 20 60 10 \
+        "1"  "Onsite Tech:    ${TECH_NAME}"          \
+        "2"  "SR Contact:     ${SR_CONTACT}"         \
+        "3"  "Job Number:     ${JOB_NUM}"            \
+        "4"  "Notes:          ${NOTES:0:30}"         \
+        "5"  "Location:       ${LOCATION}"           \
+        "6"  "Server Make:    ${SRV_MAKE}"           \
+        "7"  "Server Model:   ${SRV_MODEL}"          \
+        "8"  "Server Serial:  ${SRV_SERIAL}"         \
+        "9"  "Switch IP:      ${SW_IP}"              \
+        "10" "Switch MAC:     ${SW_MAC}"             \
+        --title "Edit Field" 3>&1 1>&2 2>&3) || return 0
+
+    local val
+    case "$choice" in
+        1)  val=$(wt_input "Edit" "Onsite Tech Name:"   "${TECH_NAME}")   && TECH_NAME="$val"   || true ;;
+        2)  val=$(wt_input "Edit" "SR Support Contact:" "${SR_CONTACT}")  && SR_CONTACT="$val"  || true ;;
+        3)  val=$(wt_input "Edit" "Job / Ticket #:"     "${JOB_NUM}")     && JOB_NUM="$val"     || true ;;
+        4)  val=$(wt_input "Edit" "Notes:"              "${NOTES}")       && NOTES="$val"       || true ;;
+        5)  val=$(wt_input "Edit" "Location:"           "${LOCATION}")    && LOCATION="$val"    || true ;;
+        6)  val=$(wt_input "Edit" "Server Make:"        "${SRV_MAKE}")    && SRV_MAKE="$val"    || true ;;
+        7)  val=$(wt_input "Edit" "Server Model:"       "${SRV_MODEL}")   && SRV_MODEL="$val"   || true ;;
+        8)  val=$(wt_input "Edit" "Server Serial:"      "${SRV_SERIAL}")  && SRV_SERIAL="$val"  || true ;;
+        9)  val=$(wt_input "Edit" "Switch IP:"          "${SW_IP}")       && SW_IP="$val"       || true ;;
+        10) val=$(wt_input "Edit" "Switch MAC:"         "${SW_MAC}")      && SW_MAC="$val"      || true ;;
+    esac
+}
+
+# ── Markdown builder ──────────────────────────────────────────────────────────
+build_md() {
+    local out="$1"
+    {
+        printf "# Sportradar — Site Install Report\n\n"
+        printf "| | |\n|---|---|\n"
+        printf "| **Location** | %s |\n" "$LOCATION"
+        printf "| **Date** | %s |\n"     "$INST_DATE"
+        [[ -n "$JOB_NUM" ]] && printf "| **Job #** | %s |\n" "$JOB_NUM"
+        printf "\n## Server\n\n"
+        printf "| Field | Value |\n|---|---|\n"
+        printf "| Make | %s |\n| Model | %s |\n| Serial | %s |\n\n" \
+            "$SRV_MAKE" "$SRV_MODEL" "$SRV_SERIAL"
+        printf "## Network Switch\n\n"
+        printf "| Field | Value |\n|---|---|\n"
+        printf "| IP | %s |\n| MAC | %s |\n| Hostname | %s |\n| Manufacturer | %s |\n\n" \
+            "$SW_IP" "$SW_MAC" "$SW_HOST" "$SW_MFR"
+        printf "## Network Devices (%d)\n\n" "${#CAMERAS[@]}"
+        if [[ ${#CAMERAS[@]} -gt 0 ]]; then
+            printf "| Hostname | IP | MAC | Vendor | Model | Serial |\n"
+            printf "|---|---|---|---|---|---|\n"
+            for cam in "${CAMERAS[@]}"; do
+                IFS='|' read -r ci cm cst cv ch cmo cse <<< "$cam"
+                printf "| %s | %s | %s | %s | %s | %s |\n" \
+                    "$ch" "$ci" "$cm" "$cv" "$cmo" "$cse"
+            done
+            printf "\n"
+        else
+            printf "_No devices detected._\n\n"
+        fi
+        printf "## Personnel\n\n"
+        printf "| Role | Name |\n|---|---|\n"
+        printf "| Onsite Tech | %s |\n| SR Support | %s |\n" \
+            "${TECH_NAME:-N/A}" "${SR_CONTACT:-N/A}"
+        [[ -n "$NOTES" ]] && printf "\n## Notes\n\n%s\n" "$NOTES"
+    } > "$out"
+}
+
+# ── GitHub Gist upload ────────────────────────────────────────────────────────
+upload_gist() {
+    local mdfile="$1"
+    local fname="sr-report-${LOCATION}-${INST_DATE// /_}.md"
+
+    local pat
+    pat=$(whiptail --passwordbox \
+        "Enter GitHub Personal Access Token\n(requires 'gist' scope — not stored on disk)" \
+        10 64 --title "GitHub Gist Upload" 3>&1 1>&2 2>&3) || return 1
+    [[ -z "$pat" ]] && { warn "No token entered — skipping upload."; return 1; }
+
+    # Build JSON payload safely via python3 (handles all escaping)
+    local payload
+    payload=$(python3 - "$LOCATION" "$INST_DATE" "$fname" "$mdfile" <<'PYEOF'
+import json, sys
+loc, date, fname, mdfile = sys.argv[1:]
+with open(mdfile) as f:
+    content = f.read()
+data = {
+    "description": f"SR Install Report \u2014 {loc} \u2014 {date}",
+    "public": False,
+    "files": {fname: {"content": content}}
+}
+print(json.dumps(data))
+PYEOF
+) || { err "Failed to build upload payload."; return 1; }
+
+    local resp
+    resp=$(curl -sf -X POST \
+        -H "Authorization: token ${pat}" \
+        -H "Accept: application/vnd.github.v3+json" \
+        https://api.github.com/gists \
+        -d "$payload") || { err "Upload failed — check token or network."; return 1; }
+
+    GIST_URL=$(python3 -c \
+        "import json,sys; print(json.loads(sys.stdin.read()).get('html_url',''))" <<< "$resp")
+    [[ -z "$GIST_URL" ]] && { err "Could not parse Gist URL from response."; return 1; }
+    return 0
+}
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+main() {
+    check_deps
+    run_discovery
+    prompt_user
+
+    local slug="${LOCATION}-${INST_DATE// /_}"
+    REPORT_FILE="/tmp/sr-report-${slug}.md"
+
+    while true; do
+        render_report
+        build_md "$REPORT_FILE"
+
+        local action
+        action=$(whiptail --menu "Choose an action:" 13 54 4 \
+            "G" "Generate & upload (GitHub Gist)" \
+            "E" "Edit a field" \
+            "R" "Start over (re-run discovery)" \
+            "Q" "Quit" \
+            --title " Actions" 3>&1 1>&2 2>&3) || action="Q"
+
+        case "$action" in
+            G)
+                if upload_gist "$REPORT_FILE"; then
+                    clear
+                    printf "\n${B}${GR}  Report uploaded!${R}\n\n"
+                    printf "  ${B}Gist URL:${R}   %s\n"   "$GIST_URL"
+                    printf "  ${B}Local copy:${R} %s\n\n" "$REPORT_FILE"
+                else
+                    printf "\n  ${B}Local copy saved:${R} %s\n\n" "$REPORT_FILE"
+                fi
+                read -rp "  Press Enter to continue..."
+                ;;
+            E)  edit_field ;;
+            R)
+                run_discovery
+                prompt_user
+                local slug="${LOCATION}-${INST_DATE// /_}"
+                REPORT_FILE="/tmp/sr-report-${slug}.md"
+                ;;
+            Q)
+                build_md "$REPORT_FILE"
+                clear
+                printf "\n${B}${CY}  Thanks — report saved to:${R}\n\n"
+                printf "  ${B}%s${R}\n\n" "$REPORT_FILE"
+                exit 0
+                ;;
+        esac
+    done
+}
+
+main "$@"
