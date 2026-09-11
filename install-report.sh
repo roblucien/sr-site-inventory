@@ -29,7 +29,7 @@ warn()    { printf "  ${YL}⚠${R}  %s\n" "$1"; }
 err()     { printf "  ${RD}✖${R}  %s\n" "$1" >&2; }
 
 # ── Data ──────────────────────────────────────────────────────────────────────
-SRV_MAKE="N/A"; SRV_MODEL="N/A"; SRV_SERIAL="N/A"
+SRV_MAKE="N/A"; SRV_MODEL="N/A"; SRV_SERIAL="N/A"; SRV_IP="N/A"; SRV_NIC_MAC="N/A"
 INST_DATE=""; LOCATION=""
 SW_MAC="N/A"; SW_IP="N/A"; SW_HOST="N/A"; SW_MFR="N/A"; SW_SERIAL="N/A"
 CAMERAS=()
@@ -61,6 +61,13 @@ discover_server() {
     [[ -z "$SRV_SERIAL" ]] && SRV_SERIAL="N/A"
     INST_DATE=$(date '+%Y-%m-%d %H:%M')
     LOCATION=$(hostname | grep -oP 'KS-US-[A-Z0-9]+' || hostname)
+
+    local ifc
+    ifc=$(ifconfig eno1 2>/dev/null || true)
+    SRV_IP=$(grep -oP 'inet \K[0-9.]+' <<< "$ifc" | head -1)
+    SRV_NIC_MAC=$(grep -oP 'ether \K[0-9a-f:]+' <<< "$ifc" | head -1)
+    [[ -z "$SRV_IP"      ]] && SRV_IP="N/A"
+    [[ -z "$SRV_NIC_MAC" ]] && SRV_NIC_MAC="N/A"
 }
 
 discover_switch() {
@@ -72,10 +79,11 @@ discover_switch() {
         warn "No DHCP lease found for switch."
         return 0
     fi
-    SW_IP=$(awk  '{print $1}' <<< "$line")
-    SW_MAC=$(awk '{print $2}' <<< "$line")
+    # dhcp-lease-list columns: MAC  IP  hostname  expiry-date  expiry-time  manufacturer...
+    SW_MAC=$(awk  '{print $1}' <<< "$line")
+    SW_IP=$(awk   '{print $2}' <<< "$line")
     SW_HOST=$(awk '{print $3}' <<< "$line")
-    SW_MFR=$(awk '{$1=$2=$3=""; gsub(/^[[:space:]]+/,""); print}' <<< "$line" | xargs)
+    SW_MFR=$(awk  '{$1=$2=$3=$4=$5=""; gsub(/^[[:space:]]+/,""); print}' <<< "$line" | xargs)
     [[ -z "$SW_IP"   ]] && SW_IP="N/A"
     [[ -z "$SW_MAC"  ]] && SW_MAC="N/A"
     [[ -z "$SW_HOST" ]] && SW_HOST="N/A"
@@ -194,9 +202,11 @@ render_report() {
     [[ -n "$JOB_NUM" ]] && field "Job #" "${JOB_NUM}"
 
     section "SERVER"
-    field "Make"   "${SRV_MAKE}"
-    field "Model"  "${SRV_MODEL}"
-    field "Serial" "${SRV_SERIAL}"
+    field "Make"    "${SRV_MAKE}"
+    field "Model"   "${SRV_MODEL}"
+    field "Serial"  "${SRV_SERIAL}"
+    field "IP"      "${SRV_IP}"
+    field "NIC MAC" "${SRV_NIC_MAC}"
 
     section "NETWORK SWITCH"
     field "IP"           "${SW_IP}"
@@ -237,7 +247,7 @@ render_report() {
 # ── Edit a field ──────────────────────────────────────────────────────────────
 edit_field() {
     local choice
-    choice=$(whiptail --menu "Select field to edit:" 22 62 12 \
+    choice=$(whiptail --menu "Select field to edit:" 24 62 14 \
         "1"  "Onsite Tech:     ${TECH_NAME}"      \
         "2"  "SR Contact:      ${SR_CONTACT}"     \
         "3"  "Job Number:      ${JOB_NUM}"        \
@@ -246,26 +256,30 @@ edit_field() {
         "6"  "Server Make:     ${SRV_MAKE}"       \
         "7"  "Server Model:    ${SRV_MODEL}"      \
         "8"  "Server Serial:   ${SRV_SERIAL}"     \
-        "9"  "Switch IP:       ${SW_IP}"          \
-        "10" "Switch MAC:      ${SW_MAC}"         \
-        "11" "Switch Serial:   ${SW_SERIAL}"      \
-        "12" "Switch MFR:      ${SW_MFR}"         \
+        "9"  "Server IP:       ${SRV_IP}"         \
+        "10" "Server NIC MAC:  ${SRV_NIC_MAC}"    \
+        "11" "Switch IP:       ${SW_IP}"          \
+        "12" "Switch MAC:      ${SW_MAC}"         \
+        "13" "Switch Serial:   ${SW_SERIAL}"      \
+        "14" "Switch MFR:      ${SW_MFR}"         \
         --title "Edit Field" 3>&1 1>&2 2>&3) || return 0
 
     local val
     case "$choice" in
-        1)  val=$(wt_input "Edit" "Onsite Tech Name:"    "${TECH_NAME}")  && TECH_NAME="$val"  || true ;;
-        2)  val=$(wt_input "Edit" "SR Support Contact:"  "${SR_CONTACT}") && SR_CONTACT="$val" || true ;;
-        3)  val=$(wt_input "Edit" "Job / Ticket #:"      "${JOB_NUM}")    && JOB_NUM="$val"    || true ;;
-        4)  val=$(wt_input "Edit" "Notes:"               "${NOTES}")      && NOTES="$val"      || true ;;
-        5)  val=$(wt_input "Edit" "Location:"            "${LOCATION}")   && LOCATION="$val"   || true ;;
-        6)  val=$(wt_input "Edit" "Server Make:"         "${SRV_MAKE}")   && SRV_MAKE="$val"   || true ;;
-        7)  val=$(wt_input "Edit" "Server Model:"        "${SRV_MODEL}")  && SRV_MODEL="$val"  || true ;;
-        8)  val=$(wt_input "Edit" "Server Serial:"       "${SRV_SERIAL}") && SRV_SERIAL="$val" || true ;;
-        9)  val=$(wt_input "Edit" "Switch IP:"           "${SW_IP}")      && SW_IP="$val"      || true ;;
-        10) val=$(wt_input "Edit" "Switch MAC:"          "${SW_MAC}")     && SW_MAC="$val"     || true ;;
-        11) val=$(wt_input "Edit" "Switch Serial:"       "${SW_SERIAL}")  && SW_SERIAL="$val"  || true ;;
-        12) val=$(wt_input "Edit" "Switch Manufacturer:" "${SW_MFR}")     && SW_MFR="$val"     || true ;;
+        1)  val=$(wt_input "Edit" "Onsite Tech Name:"    "${TECH_NAME}")    && TECH_NAME="$val"    || true ;;
+        2)  val=$(wt_input "Edit" "SR Support Contact:"  "${SR_CONTACT}")   && SR_CONTACT="$val"   || true ;;
+        3)  val=$(wt_input "Edit" "Job / Ticket #:"      "${JOB_NUM}")      && JOB_NUM="$val"      || true ;;
+        4)  val=$(wt_input "Edit" "Notes:"               "${NOTES}")        && NOTES="$val"        || true ;;
+        5)  val=$(wt_input "Edit" "Location:"            "${LOCATION}")     && LOCATION="$val"     || true ;;
+        6)  val=$(wt_input "Edit" "Server Make:"         "${SRV_MAKE}")     && SRV_MAKE="$val"     || true ;;
+        7)  val=$(wt_input "Edit" "Server Model:"        "${SRV_MODEL}")    && SRV_MODEL="$val"    || true ;;
+        8)  val=$(wt_input "Edit" "Server Serial:"       "${SRV_SERIAL}")   && SRV_SERIAL="$val"   || true ;;
+        9)  val=$(wt_input "Edit" "Server IP:"           "${SRV_IP}")       && SRV_IP="$val"       || true ;;
+        10) val=$(wt_input "Edit" "Server NIC MAC:"      "${SRV_NIC_MAC}")  && SRV_NIC_MAC="$val"  || true ;;
+        11) val=$(wt_input "Edit" "Switch IP:"           "${SW_IP}")        && SW_IP="$val"        || true ;;
+        12) val=$(wt_input "Edit" "Switch MAC:"          "${SW_MAC}")       && SW_MAC="$val"       || true ;;
+        13) val=$(wt_input "Edit" "Switch Serial:"       "${SW_SERIAL}")    && SW_SERIAL="$val"    || true ;;
+        14) val=$(wt_input "Edit" "Switch Manufacturer:" "${SW_MFR}")       && SW_MFR="$val"       || true ;;
     esac
 }
 
@@ -280,8 +294,8 @@ build_md() {
         [[ -n "$JOB_NUM" ]] && printf "| **Job #** | %s |\n" "$JOB_NUM"
         printf "\n## Server\n\n"
         printf "| Field | Value |\n|---|---|\n"
-        printf "| Make | %s |\n| Model | %s |\n| Serial | %s |\n\n" \
-            "$SRV_MAKE" "$SRV_MODEL" "$SRV_SERIAL"
+        printf "| Make | %s |\n| Model | %s |\n| Serial | %s |\n| IP | %s |\n| NIC MAC | %s |\n\n" \
+            "$SRV_MAKE" "$SRV_MODEL" "$SRV_SERIAL" "$SRV_IP" "$SRV_NIC_MAC"
         printf "## Network Switch\n\n"
         printf "| Field | Value |\n|---|---|\n"
         printf "| IP | %s |\n| MAC | %s |\n| Hostname | %s |\n| Manufacturer | %s |\n| Serial | %s |\n\n" \
