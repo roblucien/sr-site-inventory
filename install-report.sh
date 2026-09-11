@@ -85,24 +85,33 @@ discover_switch() {
 discover_switch_serial() {
     [[ "$SW_IP" == "N/A" ]] && return 0
 
-    local sw_pass
+    local sw_user sw_pass val
+    val=$(wt_input "Switch Login" "SSH username for switch at ${SW_IP}:" "admin") \
+        && sw_user="$val" || return 0
+    [[ -z "$sw_user" ]] && return 0
+
     sw_pass=$(whiptail --passwordbox \
-        "SSH password for network switch at ${SW_IP}:" \
+        "SSH password for ${sw_user}@${SW_IP}:" \
         8 56 --title "Switch Login" 3>&1 1>&2 2>&3) || return 0
     [[ -z "$sw_pass" ]] && return 0
 
-    info "SSHing into switch ${SW_IP} to retrieve serial..."
-    local inv
+    info "SSHing into switch ${SW_IP} as ${sw_user}..."
+    local inv ssh_err
+    ssh_err=$(mktemp)
     inv=$(sshpass -p "$sw_pass" ssh \
         -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
         -o ConnectTimeout=8 \
         -o BatchMode=no \
-        "admin@${SW_IP}" "sh inventory" 2>/dev/null) || {
-        warn "Could not SSH into switch — serial will be N/A"
+        -T \
+        "${sw_user}@${SW_IP}" "show inventory" 2>"$ssh_err") || {
+        warn "Switch SSH failed: $(cat "$ssh_err" | tail -1)"
+        rm -f "$ssh_err"
         return 0
     }
+    rm -f "$ssh_err"
 
-    # 'show inventory' on Cisco: "SN: XXXXXXXXXXX"
+    # Cisco 'show inventory' output: "SN: XXXXXXXXXXX"
     SW_SERIAL=$(grep -i '\bSN:' <<< "$inv" | head -1 \
         | sed 's/.*SN:[[:space:]]*//' | awk '{print $1}')
     [[ -z "$SW_SERIAL" ]] && SW_SERIAL="N/A"
@@ -140,6 +149,8 @@ discover_cameras() {
 
         [[ -z "$parsed" ]] && continue
         [[ "$parsed" =~ ^[0-9]+\. ]] || continue
+        # Skip the switch — already captured separately
+        [[ "$parsed" == "${SW_IP}|"* ]] && continue
         CAMERAS+=("$parsed")
     done <<< "$raw"
 }
