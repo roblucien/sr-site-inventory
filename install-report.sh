@@ -2,6 +2,14 @@
 # install-report.sh — Sportradar Site Install Inventory
 # https://github.com/roblucien/sr-site-inventory
 
+# When piped via curl|bash, stdin is the pipe not a tty — save script and re-exec with /dev/tty
+if [[ ! -t 0 ]]; then
+    tmp=$(mktemp /tmp/sr-report-XXXXXX.sh)
+    cat > "$tmp"
+    chmod +x "$tmp"
+    exec bash "$tmp" "$@" < /dev/tty
+fi
+
 set -uo pipefail
 
 # ── Colors ────────────────────────────────────────────────────────────────────
