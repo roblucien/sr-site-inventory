@@ -95,7 +95,7 @@ discover_switch_serial() {
     [[ "$SW_IP" == "N/A" ]] && return 0
 
     local sw_user val
-    val=$(wt_input "Switch Login" "SSH username for switch at ${SW_IP}:" "keeadmin") \
+    val=$(wt_input "Switch Login" "SSH username for switch at ${SW_IP}:" "admin") \
         && sw_user="$val" || return 0
     [[ -z "$sw_user" ]] && return 0
 
@@ -129,7 +129,7 @@ EXPECTEOF
 ) || { warn "Switch SSH failed — serial will be N/A"; return 0; }
 
     # Parse chassis (NAME: "1") and SFP (NAME: 2nd block) PID/SN
-    # Format: PID: C1300-8MGP-2X   VID: V01   SN: DNI29230A4N
+    # Format: PID: <model>   VID: <version>   SN: <serial>
     local parsed_inv
     parsed_inv=$(awk '
         /NAME:/ { block++ }
@@ -158,7 +158,7 @@ discover_cameras() {
     CAMERAS=()
     local raw
     raw=$(kee camera detect 2>/dev/null || true)
-    [[ -z "$raw" ]] && { warn "kee camera detect: no output."; return 0; }
+    [[ -z "$raw" ]] && { warn "Network device detection: no output."; return 0; }
 
     # Actual column order (row# ip iface mac last_seen[3words] state vendor[1-N words] hostname):
     #   $1=row#  $2=ip  $3=iface  $4=mac  $5-$7=last_seen  $8=state  $9..$(NF-1)=vendor  $NF=hostname
@@ -265,7 +265,7 @@ render_report() {
     field "SFP Model"    "${SW_SFP_PID}"
     field "SFP Serial"   "${SW_SFP_SN}"
 
-    section "NETWORK DEVICES  (${#CAMERAS[@]} via kee camera detect)"
+    section "NETWORK DEVICES  (${#CAMERAS[@]} detected)"
     if [[ ${#CAMERAS[@]} -eq 0 ]]; then
         printf "   ${YL}None detected${R}\n"
     else
