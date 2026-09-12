@@ -218,6 +218,25 @@ prompt_user() {
     val=$(wt_input "Notes"     "Additional notes (optional):"    "${NOTES}")      && NOTES="$val"      || true
 }
 
+# ── Camera sort: Allied first, multi-device vendors next, singles last ────────
+sorted_cameras() {
+    [[ ${#CAMERAS[@]} -eq 0 ]] && return
+    declare -A vc
+    for c in "${CAMERAS[@]}"; do
+        IFS='|' read -r _ _ _ v _ _ _ <<< "$c"
+        vc["$v"]=$(( ${vc["$v"]:-0} + 1 ))
+    done
+    for c in "${CAMERAS[@]}"; do
+        IFS='|' read -r _ _ _ v _ _ _ <<< "$c"
+        local key
+        if   [[ "$v" == *Allied* ]];        then key=1
+        elif [[ ${vc["$v"]} -gt 1 ]];       then key=2
+        else                                      key=3
+        fi
+        printf '%s|%s\n' "$key" "$c"
+    done | sort -t'|' -k1,1 -k5,5 | cut -d'|' -f2-
+}
+
 # ── Report display ────────────────────────────────────────────────────────────
 render_report() {
     clear
@@ -251,13 +270,13 @@ render_report() {
         printf "   ${YL}None detected${R}\n"
     else
         local idx=0
-        for cam in "${CAMERAS[@]}"; do
+        while IFS= read -r cam; do
             idx=$((idx+1))
             IFS='|' read -r ci cm cst cv ch cmo cse <<< "$cam"
             printf "   ${B}%2d.${R} %-15s %s\n" "$idx" "$ci" "$ch"
             printf "       ${B}Vendor:${R} %-30s ${B}Model:${R} %-12s ${B}Serial:${R} %s\n" \
                 "$cv" "$cmo" "$cse"
-        done
+        done < <(sorted_cameras)
     fi
 
     section "PERSONNEL"
@@ -335,11 +354,11 @@ build_md() {
         if [[ ${#CAMERAS[@]} -gt 0 ]]; then
             printf "| Hostname | IP | MAC | Vendor | Model | Serial |\n"
             printf "|---|---|---|---|---|---|\n"
-            for cam in "${CAMERAS[@]}"; do
+            while IFS= read -r cam; do
                 IFS='|' read -r ci cm cst cv ch cmo cse <<< "$cam"
                 printf "| %s | %s | %s | %s | %s | %s |\n" \
                     "$ch" "$ci" "$cm" "$cv" "$cmo" "$cse"
-            done
+            done < <(sorted_cameras)
             printf "\n"
         else
             printf "_No devices detected._\n\n"
@@ -419,10 +438,26 @@ main() {
                     printf "\n${B}${GR}  Report uploaded!${R}\n\n"
                     printf "  ${B}Gist URL:${R}   %s\n"   "$GIST_URL"
                     printf "  ${B}Local copy:${R} %s\n\n" "$REPORT_FILE"
+                    local next
+                    next=$(whiptail --menu "What next?" 10 50 2 \
+                        "X" "Exit" \
+                        "R" "Start over (new report)" \
+                        --title "Done" 3>&1 1>&2 2>&3) || next="X"
+                    if [[ "$next" == "R" ]]; then
+                        run_discovery
+                        prompt_user
+                        slug="${LOCATION}-${INST_DATE// /_}"
+                        REPORT_FILE="/tmp/sr-report-${slug}.md"
+                    else
+                        clear
+                        printf "\n${B}${CY}  Thanks — report saved to:${R}\n\n"
+                        printf "  ${B}%s${R}\n\n" "$REPORT_FILE"
+                        exit 0
+                    fi
                 else
                     printf "\n  ${B}Local copy saved:${R} %s\n\n" "$REPORT_FILE"
+                    read -rp "  Press Enter to continue..."
                 fi
-                read -rp "  Press Enter to continue..."
                 ;;
             E)  edit_field ;;
             R)
