@@ -31,7 +31,7 @@ bash install-report.sh
 **Automatically from the network** *(if tools are present, skipped gracefully if not):*
 - Network switch — MAC, IP, hostname, manufacturer — via `dhcp-lease-list`
 - Switch serial number and SFP module info — via SSH into the switch (`show inventory`)
-- Camera/network devices — MAC, IP, hostname, vendor, model, serial — via `kee camera detect`
+- Camera/network devices — MAC, IP, hostname, vendor, model, serial — via a network device detection tool
 
 **Prompted interactively:**
 - Onsite technician name
@@ -90,7 +90,7 @@ A local Markdown copy is always saved to `/tmp/sr-report-<LOCATION>-<DATE>.md` r
 
 ## Notes
 
-- If `kee`, `dhcp-lease-list`, or other network tools are not present, the script warns and continues — nothing breaks
-- Hostname location parsing expects a `KS-US-XXXX`-style convention; falls back to raw hostname if not matched
-- Switch SSH defaults to username `keeadmin` — adjustable at runtime via the prompt
+- If optional network tools are not present, the script warns and continues — nothing breaks
+- Hostname location parsing expects a site-coded hostname convention; falls back to raw hostname if not matched
+- Switch SSH username is prompted at runtime and can be set to whatever the switch requires
 - Tested on Ubuntu 22.04 and 24.04 headless servers over SSH
