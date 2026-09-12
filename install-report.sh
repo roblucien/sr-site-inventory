@@ -32,6 +32,7 @@ err()     { printf "  ${RD}✖${R}  %s\n" "$1" >&2; }
 SRV_MAKE="N/A"; SRV_MODEL="N/A"; SRV_SERIAL="N/A"; SRV_IP="N/A"; SRV_NIC_MAC="N/A"
 INST_DATE=""; LOCATION=""
 SW_MAC="N/A"; SW_IP="N/A"; SW_HOST="N/A"; SW_MFR="N/A"; SW_SERIAL="N/A"
+SW_SFP_PID="N/A"; SW_SFP_SN="N/A"
 CAMERAS=()
 TECH_NAME=""; SR_CONTACT=""; JOB_NUM=""; NOTES=""
 REPORT_FILE=""; GIST_URL=""
@@ -127,16 +128,30 @@ expect eof
 EXPECTEOF
 ) || { warn "Switch SSH failed — serial will be N/A"; return 0; }
 
-    # Parse SN from the chassis entry (NAME: "1" block)
+    # Parse chassis (NAME: "1") and SFP (NAME: 2nd block) PID/SN
     # Format: PID: C1300-8MGP-2X   VID: V01   SN: DNI29230A4N
-    SW_SERIAL=$(awk '
-        /NAME:.*"1"/ { found=1 }
-        found && /SN:/ {
-            match($0, /SN:[[:space:]]*([^[:space:]]+)/, a)
-            print a[1]; exit
+    local parsed_inv
+    parsed_inv=$(awk '
+        /NAME:/ { block++ }
+        block == 1 && /PID:/ {
+            match($0, /SN:[[:space:]]*([^[:space:]]+)/, s)
+            print "chassis_sn=" s[1]
+        }
+        block == 2 && /PID:/ {
+            match($0, /PID:[[:space:]]*([^[:space:]]+)/, p)
+            match($0, /SN:[[:space:]]*([^[:space:]]+)/, s)
+            print "sfp_pid=" p[1]
+            print "sfp_sn=" s[1]
+            exit
         }
     ' <<< "$inv")
-    [[ -z "$SW_SERIAL" ]] && SW_SERIAL="N/A"
+
+    SW_SERIAL=$(grep  'chassis_sn=' <<< "$parsed_inv" | cut -d= -f2)
+    SW_SFP_PID=$(grep 'sfp_pid='   <<< "$parsed_inv" | cut -d= -f2)
+    SW_SFP_SN=$(grep  'sfp_sn='    <<< "$parsed_inv" | cut -d= -f2)
+    [[ -z "$SW_SERIAL"  ]] && SW_SERIAL="N/A"
+    [[ -z "$SW_SFP_PID" ]] && SW_SFP_PID="N/A"
+    [[ -z "$SW_SFP_SN"  ]] && SW_SFP_SN="N/A"
 }
 
 discover_cameras() {
@@ -228,6 +243,8 @@ render_report() {
     field "Hostname"     "${SW_HOST}"
     field "Manufacturer" "${SW_MFR}"
     field "Serial"       "${SW_SERIAL}"
+    field "SFP Model"    "${SW_SFP_PID}"
+    field "SFP Serial"   "${SW_SFP_SN}"
 
     section "NETWORK DEVICES  (${#CAMERAS[@]} via kee camera detect)"
     if [[ ${#CAMERAS[@]} -eq 0 ]]; then
@@ -312,8 +329,8 @@ build_md() {
             "$SRV_MAKE" "$SRV_MODEL" "$SRV_SERIAL" "$SRV_IP" "$SRV_NIC_MAC"
         printf "## Network Switch\n\n"
         printf "| Field | Value |\n|---|---|\n"
-        printf "| IP | %s |\n| MAC | %s |\n| Hostname | %s |\n| Manufacturer | %s |\n| Serial | %s |\n\n" \
-            "$SW_IP" "$SW_MAC" "$SW_HOST" "$SW_MFR" "$SW_SERIAL"
+        printf "| IP | %s |\n| MAC | %s |\n| Hostname | %s |\n| Manufacturer | %s |\n| Serial | %s |\n| SFP Model | %s |\n| SFP Serial | %s |\n\n" \
+            "$SW_IP" "$SW_MAC" "$SW_HOST" "$SW_MFR" "$SW_SERIAL" "$SW_SFP_PID" "$SW_SFP_SN"
         printf "## Network Devices (%d)\n\n" "${#CAMERAS[@]}"
         if [[ ${#CAMERAS[@]} -gt 0 ]]; then
             printf "| Hostname | IP | MAC | Vendor | Model | Serial |\n"
