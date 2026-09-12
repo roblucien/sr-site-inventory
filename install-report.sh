@@ -434,10 +434,9 @@ main() {
         case "$action" in
             G)
                 if upload_gist "$REPORT_FILE"; then
-                    clear
-                    printf "\n${B}${GR}  Report uploaded!${R}\n\n"
-                    printf "  ${B}Gist URL:${R}   %s\n"   "$GIST_URL"
-                    printf "  ${B}Local copy:${R} %s\n\n" "$REPORT_FILE"
+                    whiptail --msgbox \
+                        "Report uploaded successfully!\n\nGist URL:\n${GIST_URL}\n\nLocal copy:\n${REPORT_FILE}" \
+                        14 72 --title "Upload Complete"
                     local next
                     next=$(whiptail --menu "What next?" 10 50 2 \
                         "X" "Exit" \
