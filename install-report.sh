@@ -39,7 +39,7 @@ REPORT_FILE=""; GIST_URL=""
 # ── Dependencies ──────────────────────────────────────────────────────────────
 check_deps() {
     local missing=()
-    for cmd in whiptail dmidecode curl python3 sshpass; do
+    for cmd in whiptail dmidecode curl python3 expect; do
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
     [[ ${#missing[@]} -eq 0 ]] && return 0
@@ -93,35 +93,49 @@ discover_switch() {
 discover_switch_serial() {
     [[ "$SW_IP" == "N/A" ]] && return 0
 
-    local sw_user sw_pass val
-    val=$(wt_input "Switch Login" "SSH username for switch at ${SW_IP}:" "admin") \
+    local sw_user val
+    val=$(wt_input "Switch Login" "SSH username for switch at ${SW_IP}:" "keeadmin") \
         && sw_user="$val" || return 0
     [[ -z "$sw_user" ]] && return 0
 
+    local sw_pass
     sw_pass=$(whiptail --passwordbox \
         "SSH password for ${sw_user}@${SW_IP}:" \
         8 56 --title "Switch Login" 3>&1 1>&2 2>&3) || return 0
     [[ -z "$sw_pass" ]] && return 0
 
     info "SSHing into switch ${SW_IP} as ${sw_user}..."
-    local inv ssh_err
-    ssh_err=$(mktemp)
-    inv=$(sshpass -p "$sw_pass" ssh \
-        -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o ConnectTimeout=8 \
-        -o BatchMode=no \
-        -T \
-        "${sw_user}@${SW_IP}" "show inventory" 2>"$ssh_err") || {
-        warn "Switch SSH failed: $(cat "$ssh_err" | tail -1)"
-        rm -f "$ssh_err"
-        return 0
-    }
-    rm -f "$ssh_err"
 
-    # Cisco 'show inventory' output: "SN: XXXXXXXXXXX"
-    SW_SERIAL=$(grep -i '\bSN:' <<< "$inv" | head -1 \
-        | sed 's/.*SN:[[:space:]]*//' | awk '{print $1}')
+    # Pass password via env var to avoid Tcl escaping issues
+    local inv
+    inv=$(SWITCH_PASS="$sw_pass" expect 2>/dev/null << EXPECTEOF
+log_user 0
+set timeout 15
+spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ${sw_user}@${SW_IP}
+expect {
+    -re "yes/no.*\\\\?" { send "yes\r"; exp_continue }
+    -nocase "password:"  { send "\$env(SWITCH_PASS)\r" }
+    timeout { exit 1 }
+    eof     { exit 1 }
+}
+expect "#"
+send "show inventory\r"
+expect "#"
+puts \$expect_out(buffer)
+send "exit\r"
+expect eof
+EXPECTEOF
+) || { warn "Switch SSH failed — serial will be N/A"; return 0; }
+
+    # Parse SN from the chassis entry (NAME: "1" block)
+    # Format: PID: C1300-8MGP-2X   VID: V01   SN: DNI29230A4N
+    SW_SERIAL=$(awk '
+        /NAME:.*"1"/ { found=1 }
+        found && /SN:/ {
+            match($0, /SN:[[:space:]]*([^[:space:]]+)/, a)
+            print a[1]; exit
+        }
+    ' <<< "$inv")
     [[ -z "$SW_SERIAL" ]] && SW_SERIAL="N/A"
 }
 
